@@ -1,0 +1,1453 @@
+name: Build Godot 4.7.1 GDScript Secure Final
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      GODOT_TAG: 4.7.1-stable
+      SCRIPT_AES256_ENCRYPTION_KEY: ${{ secrets.SCRIPT_AES256_ENCRYPTION_KEY }}
+      SCONSFLAGS: verbose=yes warnings=all
+
+      # Pin the exact Godot-Secure revision that produced the working Universal v5 build.
+      # This avoids silently changing cryptographic source transformations if upstream changes.
+      GODOT_SECURE_COMMIT: 03c51a91d8d08036fff032f6575035f884bd2463
+      GODOT_SECURE_SCRIPT: Godot-Secure/Godot Secure Scripts/universal/Godot Secure AES-256 Universal v5-Beta.py
+
+    steps:
+
+      # =========================================================
+      # CHECKOUT
+      # =========================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+
+      # =========================================================
+      # ENCRYPTION KEY PREFLIGHT
+      # =========================================================
+
+      - name: Validate AES-256 encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::add-mask::$SCRIPT_AES256_ENCRYPTION_KEY"
+
+          if [ -z "${SCRIPT_AES256_ENCRYPTION_KEY:-}" ]; then
+            echo "ERROR: SCRIPT_AES256_ENCRYPTION_KEY is empty."
+            exit 1
+          fi
+
+          if [ "${#SCRIPT_AES256_ENCRYPTION_KEY}" -ne 64 ]; then
+            echo "ERROR: SCRIPT_AES256_ENCRYPTION_KEY must contain exactly 64 hexadecimal characters."
+            echo "Detected length: ${#SCRIPT_AES256_ENCRYPTION_KEY}"
+            exit 1
+          fi
+
+          if ! [[ "$SCRIPT_AES256_ENCRYPTION_KEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "ERROR: SCRIPT_AES256_ENCRYPTION_KEY contains non-hexadecimal characters."
+            exit 1
+          fi
+
+          echo "[OK] AES-256 key format is valid: 64 hexadecimal characters."
+
+
+      # =========================================================
+      # BUILD DEPENDENCIES
+      # =========================================================
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            scons \
+            pkg-config \
+            python3 \
+            python3-pip \
+            mingw-w64 \
+            clang \
+            zip \
+            unzip \
+            curl \
+            git \
+            cmake
+
+          sudo update-alternatives \
+            --install \
+            /usr/bin/x86_64-w64-mingw32-g++ \
+            x86_64-w64-mingw32-g++ \
+            /usr/bin/x86_64-w64-mingw32-g++-posix \
+            100
+
+          sudo update-alternatives \
+            --install \
+            /usr/bin/x86_64-w64-mingw32-gcc \
+            x86_64-w64-mingw32-gcc \
+            /usr/bin/x86_64-w64-mingw32-gcc-posix \
+            100
+
+          sudo update-alternatives \
+            --set \
+            x86_64-w64-mingw32-g++ \
+            /usr/bin/x86_64-w64-mingw32-g++-posix
+
+          sudo update-alternatives \
+            --set \
+            x86_64-w64-mingw32-gcc \
+            /usr/bin/x86_64-w64-mingw32-gcc-posix
+
+
+      # =========================================================
+      # CLONE GODOT
+      # =========================================================
+
+      - name: Clone Godot 4.7.1
+        shell: bash
+        run: |
+          set -e
+
+          echo "Godot version: $GODOT_TAG"
+
+          git clone \
+            --depth 1 \
+            --branch "$GODOT_TAG" \
+            https://github.com/godotengine/godot.git \
+            godot
+
+
+      # =========================================================
+      # CLONE GODOT SECURE
+      # =========================================================
+
+      - name: Clone pinned Godot Secure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            https://github.com/KnifeXRage/Godot-Secure.git
+
+          git -C Godot-Secure checkout --detach "$GODOT_SECURE_COMMIT"
+
+          ACTUAL_COMMIT=$(git -C Godot-Secure rev-parse HEAD)
+
+          if [ "$ACTUAL_COMMIT" != "$GODOT_SECURE_COMMIT" ]; then
+            echo "ERROR: Godot Secure commit mismatch."
+            exit 1
+          fi
+
+          echo "[OK] Godot Secure pinned commit: $ACTUAL_COMMIT"
+
+      # =========================================================
+      # VERIFY EXACT GODOT SECURE SCRIPT
+      # =========================================================
+
+      - name: Verify Godot Secure Universal v5 script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT="$GODOT_SECURE_SCRIPT"
+
+          if [ ! -f "$SCRIPT" ]; then
+            echo "ERROR: Expected Godot Secure Universal v5 AES script not found."
+            echo "Expected: $SCRIPT"
+            exit 1
+          fi
+
+          # Universal v5 contains explicit Godot >= 4.7 handling.
+          if ! grep -Fq 'godot_version_int >= 47' "$SCRIPT"; then
+            echo "ERROR: Selected Godot Secure script does not expose the expected Godot 4.7+ branch."
+            exit 1
+          fi
+
+          echo "[OK] Using exact Universal v5 AES script."
+          echo "SCRIPT=$SCRIPT" >> "$GITHUB_ENV"
+
+      # =========================================================
+      # SAVE BASELINE
+      # =========================================================
+
+      - name: Save original encryption files
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p /tmp/godot_secure_baseline
+
+          cp \
+            godot/core/io/file_access_pack.h \
+            /tmp/godot_secure_baseline/file_access_pack.h
+
+          cp \
+            godot/core/io/file_access_encrypted.h \
+            /tmp/godot_secure_baseline/file_access_encrypted.h
+
+          cp \
+            godot/core/io/file_access_encrypted.cpp \
+            /tmp/godot_secure_baseline/file_access_encrypted.cpp
+
+
+      # =========================================================
+      # APPLY GODOT SECURE
+      #
+      # Godot-Secure may return exit code 1 after completing
+      # successfully because of its interactive exit prompt.
+      #
+      # We therefore verify the source changes ourselves.
+      # =========================================================
+
+      - name: Apply Godot Secure with advanced key derivation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export SCRIPT_AES256_ENCRYPTION_KEY="$SCRIPT_AES256_ENCRYPTION_KEY"
+
+          # Universal v5 prompts:
+          #   1) Start operations?          YES
+          #   2) Use custom headers?        NO  -> random per build
+          #   3) Use custom token?          NO  -> random 32-byte token
+          #   4) Advanced key derivation?   YES -> unique generated formula
+          #   5) Final Enter to exit
+          #
+          # Its output includes the generated token and may echo the encryption key,
+          # so never print the raw script output into the GitHub Actions log.
+          set +e
+          printf 'y\nn\nn\ny\n\n' | python3 "$SCRIPT" godot > /tmp/godot_secure_apply.log 2>&1
+          SCRIPT_EXIT_CODE=$?
+          set -e
+
+          # Godot-Secure may exit with code 1 after successful interactive completion.
+          # Validate the actual source tree instead of trusting that exit code.
+          fail_with_sanitized_log() {
+            echo
+            echo "=========================================="
+            echo "GODOT SECURE APPLY FAILED"
+            echo "=========================================="
+            echo "Godot Secure exit code: $SCRIPT_EXIT_CODE"
+            echo
+            echo "Sanitized tail of Godot Secure output:"
+            tail -200 /tmp/godot_secure_apply.log \
+              | sed -E 's/[0-9A-Fa-f]{64}/[REDACTED_64_HEX]/g'
+            exit 1
+          }
+
+          if [ ! -s "godot/core/crypto/security_token.h" ]; then
+            echo "ERROR: security_token.h was not generated."
+            fail_with_sanitized_log
+          fi
+
+          if cmp -s \
+            /tmp/godot_secure_baseline/file_access_pack.h \
+            godot/core/io/file_access_pack.h; then
+            echo "ERROR: file_access_pack.h was not modified."
+            fail_with_sanitized_log
+          fi
+
+          if cmp -s \
+            /tmp/godot_secure_baseline/file_access_encrypted.h \
+            godot/core/io/file_access_encrypted.h; then
+            echo "ERROR: file_access_encrypted.h was not modified."
+            fail_with_sanitized_log
+          fi
+
+          if cmp -s \
+            /tmp/godot_secure_baseline/file_access_encrypted.cpp \
+            godot/core/io/file_access_encrypted.cpp; then
+            echo "ERROR: file_access_encrypted.cpp was not modified."
+            fail_with_sanitized_log
+          fi
+
+          if ! grep -Fq \
+            'security_token.h' \
+            godot/core/io/file_access_encrypted.cpp; then
+            echo "ERROR: security token is not integrated."
+            fail_with_sanitized_log
+          fi
+
+          if ! grep -Fq \
+            'Security::TOKEN[i]' \
+            godot/core/io/file_access_encrypted.cpp; then
+            echo "ERROR: security token is not used in encrypted file access."
+            fail_with_sanitized_log
+          fi
+
+          # With Advanced Key Derivation enabled the trivial XOR-only assignment
+          # should no longer be the active derivation expression.
+          if grep -Fq \
+            'token_key.write[i] = key_ptr[i] ^ Security::TOKEN[i];' \
+            godot/core/io/file_access_encrypted.cpp; then
+            echo "ERROR: Advanced key derivation was requested but XOR-only derivation remains."
+            fail_with_sanitized_log
+          fi
+
+          rm -f /tmp/godot_secure_apply.log
+
+          echo "[OK] Godot Secure Universal v5 applied."
+          echo "[OK] Random custom PCK/encrypted headers generated."
+          echo "[OK] Random security token integrated."
+          echo "[OK] Advanced per-build key derivation integrated."
+
+      # =========================================================
+      # IMPORTANT
+      #
+      # Everything built from this point onward shares the SAME:
+      #
+      # - PACK_HEADER_MAGIC
+      # - ENCRYPTED_HEADER_MAGIC
+      # - Security Token
+      #
+      # Therefore the editor can create PCK files compatible
+      # with the templates.
+      # =========================================================
+
+
+
+      # =========================================================
+      # BUILD WINDOWS SECURE GDSCRIPT EDITOR
+      #
+      # NOTE:
+      # We compile the editor BEFORE applying the release-only
+      # error-reporting hardening.
+      #
+      # This gives you normal useful editor finals while
+      # keeping the exported game hardened.
+      # =========================================================
+
+      - name: Build Windows Secure GDScript editor
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd godot
+
+          env SCRIPT_AES256_ENCRYPTION_KEY="$SCRIPT_AES256_ENCRYPTION_KEY" scons \
+            platform=windows \
+            target=editor \
+            arch=x86_64 \
+            debug_symbols=no \
+            d3d12=no \
+            2>&1 | tee "../scons_windows_editor.log"
+
+          cd ..
+
+          if ! grep -Fq \
+            'Compiling Godot with custom `SCRIPT_AES256_ENCRYPTION_KEY` set as environment variable.' \
+            "scons_windows_editor.log"; then
+
+            echo "ERROR: Godot/SCons did not confirm that SCRIPT_AES256_ENCRYPTION_KEY was compiled into this target."
+            echo "Build log: scons_windows_editor.log"
+            exit 1
+
+          fi
+
+          echo "[OK] SCons confirmed the custom encryption key for this target."
+
+
+
+      # =========================================================
+      # VERIFY WINDOWS EDITOR
+      # =========================================================
+
+      - name: Detect Windows Secure editor
+        shell: bash
+        run: |
+          set -e
+
+          WINDOWS_EDITOR="godot/bin/godot.windows.editor.x86_64.exe"
+
+          if [ ! -f "$WINDOWS_EDITOR" ]; then
+            echo "ERROR: Windows GDScript editor not found."
+
+            find godot/bin \
+              -maxdepth 1 \
+              -type f \
+              -name "*windows*" \
+              -exec ls -lh {} \;
+
+            exit 1
+          fi
+
+          EDITOR_SIZE=$(stat -c%s "$WINDOWS_EDITOR")
+
+          echo "Windows editor:"
+          ls -lh "$WINDOWS_EDITOR"
+
+          if [ "$EDITOR_SIZE" -lt 10000000 ]; then
+            echo "ERROR: Windows editor is suspiciously small."
+            echo "Size: $EDITOR_SIZE bytes"
+            exit 1
+          fi
+
+          echo "WINDOWS_EDITOR=$WINDOWS_EDITOR" >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # PACKAGE WINDOWS SECURE GDSCRIPT EDITOR
+      # =========================================================
+
+      - name: Package Windows Secure GDScript editor
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p package_editor_windows
+
+          cp \
+            "$WINDOWS_EDITOR" \
+            package_editor_windows/Godot_v4.7.1-stable_secure_win64.exe
+
+          # Include console wrapper if it exists.
+
+          WINDOWS_EDITOR_CONSOLE="godot/bin/godot.windows.editor.x86_64.console.exe"
+
+          if [ -f "$WINDOWS_EDITOR_CONSOLE" ]; then
+
+            cp \
+              "$WINDOWS_EDITOR_CONSOLE" \
+              package_editor_windows/Godot_v4.7.1-stable_secure_win64_console.exe
+
+          fi
+
+
+          echo
+          echo "Secure editor package:"
+          du -sh package_editor_windows
+          find package_editor_windows \
+            -maxdepth 2 \
+            -type f \
+            -exec ls -lh {} \; \
+            | head -50
+
+
+          cd package_editor_windows
+
+          zip -9 \
+            -r \
+            ../godot_4.7.1_gdscript_windows_secure_editor.zip \
+            .
+
+          cd ..
+
+
+      # =========================================================
+      # RELEASE TEMPLATE BRANDING HARDENING
+      #
+      # Keep the distributed editor clearly identifiable as Secure,
+      # but do not advertise Godot Secure in the release templates.
+      # This does not provide cryptographic security by itself; it
+      # simply removes an unnecessary static-analysis breadcrumb.
+      # =========================================================
+
+      - name: Remove Godot Secure branding from release templates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path("godot/version.py")
+          text = path.read_text(encoding="utf-8")
+
+          secure = 'name = "Godot Engine (With Godot Secure)"'
+          normal = 'name = "Godot Engine"'
+
+          if secure not in text:
+              print("ERROR: Expected Godot Secure engine branding not found before release-template hardening.")
+              sys.exit(1)
+
+          path.write_text(text.replace(secure, normal, 1), encoding="utf-8")
+          print("[PATCHED] Release template engine branding restored to standard Godot name.")
+          PY
+
+
+      # =========================================================
+      # RELEASE TEMPLATE SECURITY LAYER 1
+      #
+      # From this point onwards we modify the source further.
+      #
+      # The Windows editor above is already compiled and remains
+      # compatible because these changes only affect reporting.
+      # =========================================================
+
+      - name: Remove encryption-specific template error messages
+        shell: bash
+        run: |
+          set -e
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+
+          def fail(message):
+              print()
+              print("==========================================")
+              print("SECURITY PATCH ERROR")
+              print("==========================================")
+              print(message)
+              print()
+              sys.exit(1)
+
+
+          # =====================================================
+          # DECRYPTED FILE MD5 ERROR
+          # =====================================================
+
+          path = Path(
+              "godot/core/io/file_access_encrypted.cpp"
+          )
+
+          if not path.exists():
+              fail(
+                  "file_access_encrypted.cpp not found."
+              )
+
+          text = path.read_text(
+              encoding="utf-8"
+          )
+
+          sensitive = (
+              "The MD5 sum of the decrypted file does not match"
+          )
+
+
+          if sensitive in text:
+
+              pattern = re.compile(
+                  r'^([ \t]*)'
+                  r'ERR_FAIL_COND_V_MSG\('
+                  r'(.+)'
+                  r',\s*ERR_FILE_CORRUPT\s*,\s*'
+                  r'"The MD5 sum of the decrypted file does not match'
+                  r'[^"]*"'
+                  r'\s*\);'
+                  r'[ \t]*$',
+                  re.MULTILINE
+              )
+
+              match = pattern.search(text)
+
+
+              if not match:
+
+                  print()
+                  print(
+                      "Sensitive MD5 string exists but "
+                      "could not be parsed."
+                  )
+
+                  for i, line in enumerate(
+                      text.splitlines(),
+                      start=1
+                  ):
+                      if sensitive in line:
+                          print(f"{i}: {line}")
+
+                  sys.exit(1)
+
+
+              indent = match.group(1)
+              condition = match.group(2).strip()
+
+
+              replacement = (
+                  f"{indent}if ({condition}) {{\n"
+                  f"{indent}\treturn ERR_FILE_CORRUPT;\n"
+                  f"{indent}}}"
+              )
+
+
+              text = (
+                  text[:match.start()]
+                  + replacement
+                  + text[match.end():]
+              )
+
+
+              path.write_text(
+                  text,
+                  encoding="utf-8"
+              )
+
+
+              print(
+                  "[PATCHED] Encrypted file "
+                  "MD5/decryption error"
+              )
+
+          else:
+
+              print(
+                  "[OK] MD5/decryption string already absent"
+              )
+
+
+          # =====================================================
+          # FILE_ACCESS_PACK
+          # =====================================================
+
+          path = Path(
+              "godot/core/io/file_access_pack.cpp"
+          )
+
+          if not path.exists():
+              fail(
+                  "file_access_pack.cpp not found."
+              )
+
+          text = path.read_text(
+              encoding="utf-8"
+          )
+
+
+          # =====================================================
+          # ENCRYPTED PACK DIRECTORY
+          # =====================================================
+
+          directory_message = (
+              "Can't open encrypted pack directory."
+          )
+
+
+          def remove_bool_error(text, message):
+
+              escaped = re.escape(message)
+
+              pattern = re.compile(
+                  r'^([ \t]*)'
+                  r'ERR_FAIL_COND_V_MSG\('
+                  r'(.+)'
+                  r',\s*false\s*,\s*'
+                  r'"' + escaped + r'"'
+                  r'\s*\);'
+                  r'[ \t]*$',
+                  re.MULTILINE
+              )
+
+              match = pattern.search(text)
+
+              if not match:
+                  return text, False
+
+
+              indent = match.group(1)
+              condition = match.group(2).strip()
+
+
+              replacement = (
+                  f"{indent}if ({condition}) {{\n"
+                  f"{indent}\treturn false;\n"
+                  f"{indent}}}"
+              )
+
+
+              return (
+                  text[:match.start()]
+                  + replacement
+                  + text[match.end():],
+                  True
+              )
+
+
+          directory_count = 0
+
+
+          while directory_message in text:
+
+              new_text, changed = remove_bool_error(
+                  text,
+                  directory_message
+              )
+
+
+              if not changed:
+
+                  print()
+                  print(
+                      "ERROR: encrypted pack directory "
+                      "error could not be parsed."
+                  )
+
+                  for i, line in enumerate(
+                      text.splitlines(),
+                      start=1
+                  ):
+                      if directory_message in line:
+                          print(f"{i}: {line}")
+
+                  sys.exit(1)
+
+
+              text = new_text
+              directory_count += 1
+
+
+          if directory_count:
+
+              print(
+                  f"[PATCHED] {directory_count} encrypted "
+                  "pack directory error(s)"
+              )
+
+          else:
+
+              print(
+                  "[OK] Encrypted pack directory strings absent"
+              )
+
+
+          # =====================================================
+          # PACK-REFERENCED ENCRYPTED FILE
+          # =====================================================
+
+          sensitive_pack = (
+              "Can't open encrypted pack-referenced file"
+          )
+
+          pack_count = 0
+
+
+          while sensitive_pack in text:
+
+              lines = text.splitlines(
+                  keepends=True
+              )
+
+              target_index = None
+
+
+              for i, line in enumerate(lines):
+
+                  if sensitive_pack in line:
+
+                      target_index = i
+                      break
+
+
+              if target_index is None:
+                  break
+
+
+              line = lines[target_index]
+
+
+              # -----------------------------------------------
+              # fae.is_null()
+              # -----------------------------------------------
+
+              m = re.match(
+                  r'^([ \t]*)'
+                  r'ERR_FAIL_COND_MSG\('
+                  r'fae\.is_null\(\)'
+                  r',.*'
+                  r'Can\'t open encrypted pack-referenced file'
+                  r'.*\);'
+                  r'\s*$',
+                  line
+              )
+
+
+              if m:
+
+                  indent = m.group(1)
+
+                  lines[target_index] = (
+                      f"{indent}if (fae.is_null()) {{\n"
+                      f"{indent}\tf.unref();\n"
+                      f"{indent}\treturn;\n"
+                      f"{indent}}}\n"
+                  )
+
+                  text = "".join(lines)
+
+                  pack_count += 1
+
+                  continue
+
+
+              # -----------------------------------------------
+              # err != OK
+              # -----------------------------------------------
+
+              m = re.match(
+                  r'^([ \t]*)'
+                  r'ERR_FAIL_COND_MSG\('
+                  r'err\s*!=\s*OK'
+                  r',.*'
+                  r'Can\'t open encrypted pack-referenced file'
+                  r'.*\);'
+                  r'\s*$',
+                  line
+              )
+
+
+              if m:
+
+                  indent = m.group(1)
+
+                  lines[target_index] = (
+                      f"{indent}if (err != OK) {{\n"
+                      f"{indent}\tf.unref();\n"
+                      f"{indent}\treturn;\n"
+                      f"{indent}}}\n"
+                  )
+
+                  text = "".join(lines)
+
+                  pack_count += 1
+
+                  continue
+
+
+              print()
+              print(
+                  "ERROR: encrypted pack-referenced "
+                  "error could not be parsed:"
+              )
+
+              print(
+                  f"{target_index + 1}: "
+                  f"{line.rstrip()}"
+              )
+
+              sys.exit(1)
+
+
+          path.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+
+          if pack_count:
+
+              print(
+                  f"[PATCHED] {pack_count} encrypted "
+                  "pack-referenced error(s)"
+              )
+
+          else:
+
+              print(
+                  "[OK] Encrypted pack-referenced strings absent"
+              )
+
+
+          # =====================================================
+          # FINAL CHECK
+          # =====================================================
+
+          checks = [
+
+              (
+                  "godot/core/io/file_access_encrypted.cpp",
+                  "The MD5 sum of the decrypted file does not match"
+              ),
+
+              (
+                  "godot/core/io/file_access_pack.cpp",
+                  "Can't open encrypted pack directory"
+              ),
+
+              (
+                  "godot/core/io/file_access_pack.cpp",
+                  "Can't open encrypted pack-referenced file"
+              ),
+          ]
+
+
+          for filename, value in checks:
+
+              content = Path(filename).read_text(
+                  encoding="utf-8"
+              )
+
+              if value in content:
+
+                  fail(
+                      f"Sensitive string still exists:\n"
+                      f"{value}\n"
+                      f"in {filename}"
+                  )
+
+
+          print()
+          print(
+              "Encryption-specific template errors removed."
+          )
+          PY
+
+
+      # =========================================================
+      # RELEASE TEMPLATE SECURITY LAYER 2
+      #
+      # Strip:
+      #
+      # FUNCTION_STR
+      # __FILE__
+      # __LINE__
+      #
+      # from Godot's standard error macros.
+      #
+      # The error behavior itself remains intact.
+      # =========================================================
+
+      - name: Strip source locations from template error macros
+        shell: bash
+        run: |
+          set -e
+
+          python3 <<'PY'
+          from pathlib import Path
+          import sys
+
+
+          path = Path(
+              "godot/core/error/error_macros.h"
+          )
+
+
+          if not path.exists():
+
+              print(
+                  "ERROR: error_macros.h not found."
+              )
+
+              sys.exit(1)
+
+
+          text = path.read_text(
+              encoding="utf-8"
+          )
+
+
+          needle = (
+              "FUNCTION_STR, __FILE__, __LINE__"
+          )
+
+
+          count = text.count(
+              needle
+          )
+
+
+          print(
+              f"Found {count} standard error "
+              "source-location references."
+          )
+
+
+          if count < 10:
+
+              print()
+              print(
+                  "ERROR: Unexpected error_macros.h structure."
+              )
+
+              sys.exit(1)
+
+
+          text = text.replace(
+              needle,
+              "nullptr, nullptr, 0"
+          )
+
+
+          path.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+
+          result = path.read_text(
+              encoding="utf-8"
+          )
+
+
+          if needle in result:
+
+              print(
+                  "ERROR: source-location references remain."
+              )
+
+              sys.exit(1)
+
+
+          replacement_count = result.count(
+              "nullptr, nullptr, 0"
+          )
+
+
+          if replacement_count < count:
+
+              print(
+                  "ERROR: replacement count mismatch."
+              )
+
+              sys.exit(1)
+
+
+          print()
+          print(
+              f"[PATCHED] {count} source-location "
+              "references removed."
+          )
+          PY
+
+
+      # =========================================================
+      # VERIFY TEMPLATE HARDENING
+      # =========================================================
+
+      - name: Verify template security patches
+        shell: bash
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "Template security verification"
+          echo "=========================================="
+
+
+          if grep -R \
+            --include="*.cpp" \
+            --include="*.h" \
+            -n \
+            "The MD5 sum of the decrypted file does not match" \
+            godot/core; then
+
+            echo "ERROR: MD5 message remains."
+            exit 1
+
+          fi
+
+
+          if grep -R \
+            --include="*.cpp" \
+            --include="*.h" \
+            -n \
+            "Can't open encrypted pack directory" \
+            godot/core; then
+
+            echo "ERROR: encrypted PCK directory message remains."
+            exit 1
+
+          fi
+
+
+          if grep -R \
+            --include="*.cpp" \
+            --include="*.h" \
+            -n \
+            "Can't open encrypted pack-referenced file" \
+            godot/core; then
+
+            echo "ERROR: encrypted PCK file message remains."
+            exit 1
+
+          fi
+
+
+          if grep \
+            -n \
+            "FUNCTION_STR, __FILE__, __LINE__" \
+            godot/core/error/error_macros.h; then
+
+            echo "ERROR: source locations remain."
+            exit 1
+
+          fi
+
+
+          echo
+          echo "All template security checks passed."
+
+
+
+      # =========================================================
+      # BUILD WINDOWS GDSCRIPT RELEASE TEMPLATE
+      #
+      # CRITICAL:
+      #
+      # disable_path_overrides=no
+      #
+      # Godot 4.7.1 defaults this option to YES.
+      # We need NO because the exported game uses a side-by-side
+      # .pck file.
+      # =========================================================
+
+      - name: Build Windows encrypted GDScript release template
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd godot
+
+          env SCRIPT_AES256_ENCRYPTION_KEY="$SCRIPT_AES256_ENCRYPTION_KEY" scons \
+            platform=windows \
+            target=template_release \
+            arch=x86_64 \
+            production=yes \
+            debug_symbols=no \
+            lto=auto \
+            disable_path_overrides=no \
+            d3d12=no \
+            2>&1 | tee "../scons_windows_template_release.log"
+
+          cd ..
+
+          if ! grep -Fq \
+            'Compiling Godot with custom `SCRIPT_AES256_ENCRYPTION_KEY` set as environment variable.' \
+            "scons_windows_template_release.log"; then
+
+            echo "ERROR: Godot/SCons did not confirm that SCRIPT_AES256_ENCRYPTION_KEY was compiled into this target."
+            echo "Build log: scons_windows_template_release.log"
+            exit 1
+
+          fi
+
+          echo "[OK] SCons confirmed the custom encryption key for this target."
+
+
+      # =========================================================
+      # BUILD LINUX GDSCRIPT RELEASE TEMPLATE
+      # =========================================================
+
+      - name: Build Linux encrypted GDScript release template
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd godot
+
+          env SCRIPT_AES256_ENCRYPTION_KEY="$SCRIPT_AES256_ENCRYPTION_KEY" scons \
+            platform=linuxbsd \
+            target=template_release \
+            arch=x86_64 \
+            production=yes \
+            debug_symbols=no \
+            lto=auto \
+            disable_path_overrides=no \
+            2>&1 | tee "../scons_linux_template_release.log"
+
+          cd ..
+
+          if ! grep -Fq \
+            'Compiling Godot with custom `SCRIPT_AES256_ENCRYPTION_KEY` set as environment variable.' \
+            "scons_linux_template_release.log"; then
+
+            echo "ERROR: Godot/SCons did not confirm that SCRIPT_AES256_ENCRYPTION_KEY was compiled into this target."
+            echo "Build log: scons_linux_template_release.log"
+            exit 1
+
+          fi
+
+          echo "[OK] SCons confirmed the custom encryption key for this target."
+
+
+      # =========================================================
+      # SHOW ALL GENERATED BINARIES
+      # =========================================================
+
+      - name: Show generated binaries
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "godot/bin"
+          echo "=========================================="
+
+          find godot/bin \
+            -maxdepth 1 \
+            -type f \
+            -exec ls -lh {} \;
+
+
+      # =========================================================
+      # FIND EXACT RELEASE TEMPLATES
+      #
+      # Exact matching avoids accidentally selecting:
+      #
+      # *.console.exe
+      #
+      # which caused the previous 74 KB artifact.
+      # =========================================================
+
+      - name: Detect release templates
+        shell: bash
+        run: |
+          set -e
+
+
+          WINDOWS_TEMPLATE="godot/bin/godot.windows.template_release.x86_64.exe"
+
+          LINUX_TEMPLATE="godot/bin/godot.linuxbsd.template_release.x86_64"
+
+
+          if [ ! -f "$WINDOWS_TEMPLATE" ]; then
+
+            echo "ERROR: Windows GDScript release template not found."
+
+            find godot/bin \
+              -maxdepth 1 \
+              -type f \
+              -name "*windows*" \
+              -exec ls -lh {} \;
+
+            exit 1
+
+          fi
+
+
+          if [ ! -f "$LINUX_TEMPLATE" ]; then
+
+            echo "ERROR: Linux GDScript release template not found."
+
+            find godot/bin \
+              -maxdepth 1 \
+              -type f \
+              -name "*linuxbsd*" \
+              -exec ls -lh {} \;
+
+            exit 1
+
+          fi
+
+
+          WINDOWS_SIZE=$(stat -c%s "$WINDOWS_TEMPLATE")
+          LINUX_SIZE=$(stat -c%s "$LINUX_TEMPLATE")
+
+
+          echo "Windows:"
+          ls -lh "$WINDOWS_TEMPLATE"
+
+          echo
+          echo "Linux:"
+          ls -lh "$LINUX_TEMPLATE"
+
+
+          # Reject the tiny Windows console wrapper.
+
+          if [ "$WINDOWS_SIZE" -lt 10000000 ]; then
+
+            echo
+            echo "ERROR:"
+            echo "Windows template is suspiciously small."
+            echo "$WINDOWS_SIZE bytes"
+
+            exit 1
+
+          fi
+
+
+          if [ "$LINUX_SIZE" -lt 10000000 ]; then
+
+            echo
+            echo "ERROR:"
+            echo "Linux template is suspiciously small."
+            echo "$LINUX_SIZE bytes"
+
+            exit 1
+
+          fi
+
+
+          echo "WINDOWS_TEMPLATE=$WINDOWS_TEMPLATE" \
+            >> "$GITHUB_ENV"
+
+          echo "LINUX_TEMPLATE=$LINUX_TEMPLATE" \
+            >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # PACKAGE WINDOWS TEMPLATE
+      # =========================================================
+
+      - name: Package Windows encrypted GDScript template
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p package_windows_template
+
+
+          cp \
+            "$WINDOWS_TEMPLATE" \
+            package_windows_template/windows_release_x86_64.exe
+
+
+          # Optional console wrapper.
+
+          WINDOWS_CONSOLE="godot/bin/godot.windows.template_release.x86_64.console.exe"
+
+          if [ -f "$WINDOWS_CONSOLE" ]; then
+
+            cp \
+              "$WINDOWS_CONSOLE" \
+              package_windows_template/windows_release_x86_64_console.exe
+
+          fi
+
+
+          echo
+          echo "Windows template package:"
+          ls -lah package_windows_template
+
+
+          cd package_windows_template
+
+          zip -9 \
+            -r \
+            ../godot_4.7.1_gdscript_windows_encrypted.zip \
+            .
+
+          cd ..
+
+
+      # =========================================================
+      # PACKAGE LINUX TEMPLATE
+      # =========================================================
+
+      - name: Package Linux encrypted GDScript template
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p package_linux_template
+
+
+          cp \
+            "$LINUX_TEMPLATE" \
+            package_linux_template/linux_release.x86_64
+
+
+          chmod +x \
+            package_linux_template/linux_release.x86_64
+
+
+          echo
+          echo "Linux template package:"
+          ls -lah package_linux_template
+
+
+          cd package_linux_template
+
+          zip -9 \
+            -r \
+            ../godot_4.7.1_gdscript_linux_encrypted.zip \
+            .
+
+          cd ..
+
+
+      # =========================================================
+      # FINAL BUILD INFO
+      # =========================================================
+
+      - name: Write final build info
+        shell: bash
+        run: |
+          set -e
+
+          {
+            echo "GODOT_TAG=$GODOT_TAG"
+            echo "GODOT_COMMIT=$(git -C godot rev-parse HEAD)"
+            echo "GODOT_SECURE_COMMIT=$(git -C Godot-Secure rev-parse HEAD)"
+            echo "GODOT_SECURE_SCRIPT=$GODOT_SECURE_SCRIPT"
+            echo "ADVANCED_KEY_DERIVATION=enabled"
+            echo "RELEASE_TEMPLATE_ERROR_HARDENING=enabled"
+            echo "SCRIPT_AES256_ENCRYPTION_KEY_FORMAT=valid-64-hex"
+          } > BUILD_INFO.txt
+
+          cat BUILD_INFO.txt
+
+
+      # =========================================================
+      # SHA256
+      # =========================================================
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -e
+
+          sha256sum \
+            godot_4.7.1_gdscript_windows_encrypted.zip \
+            godot_4.7.1_gdscript_linux_encrypted.zip \
+            godot_4.7.1_gdscript_windows_secure_editor.zip \
+            > SHA256SUMS.txt
+
+          cat SHA256SUMS.txt
+
+
+      # =========================================================
+      # UPLOAD WINDOWS TEMPLATE
+      # =========================================================
+
+      - name: Upload Windows encrypted GDScript template
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-4.7.1-gdscript-windows-encrypted
+          path: godot_4.7.1_gdscript_windows_encrypted.zip
+
+
+      # =========================================================
+      # UPLOAD LINUX TEMPLATE
+      # =========================================================
+
+      - name: Upload Linux encrypted GDScript template
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-4.7.1-gdscript-linux-encrypted
+          path: godot_4.7.1_gdscript_linux_encrypted.zip
+
+
+      # =========================================================
+      # UPLOAD WINDOWS SECURE EDITOR
+      # =========================================================
+
+      - name: Upload Windows Secure GDScript editor
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-4.7.1-gdscript-windows-secure-editor
+          path: godot_4.7.1_gdscript_windows_secure_editor.zip
+
+
+
+      # =========================================================
+      # UPLOAD SAFE BUILD INFO
+      # =========================================================
+
+      - name: Upload safe build info
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-4.7.1-secure-build-info
+          path: BUILD_INFO.txt
+
+
+      # =========================================================
+      # UPLOAD CHECKSUMS
+      # =========================================================
+
+      - name: Upload SHA256 checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-checksums
+          path: SHA256SUMS.txt
